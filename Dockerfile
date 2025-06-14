@@ -11,4 +11,8 @@ RUN npm install --production
 
 COPY index.js ./
 
-CMD ["index.handler"] # 对应 AWS Lambda，但在 Koyeb 里会覆盖为 node index.js
+# 暴露给 Koyeb 健康检查器
+EXPOSE 8080
+
+# Koyeb 会执行 Procfile 中的 web: 命令
+CMD ["index.handler"]
