@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "chrome-aws-lambda": "^10.1.0",
-    "puppeteer-core": "^19.11.1",
+    "puppeteer-core": "^10.1.0", 
     "node-cron": "^3.0.0",
     "node-telegram-bot-api": "^0.61.0",
     "dotenv": "^16.0.0",
