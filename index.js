@@ -1,124 +1,114 @@
-// index.js
+// index.js (Production-Grade Version)
 
 require('dotenv').config();
-
-// We use puppeteer-core, the lightweight version without a bundled browser.
 const puppeteer     = require('puppeteer-core');
 const cron          = require('node-cron');
 const TelegramBot   = require('node-telegram-bot-api');
 const express       = require('express');
 const fs            = require('fs');
 
-// --- Configuration from Environment Variables ---
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID   = process.env.TELEGRAM_CHANNEL_ID;
-const PERIOD    = process.env.HEATMAP_PERIOD || '24h';
-const CRON_EXPR = process.env.SCRAPE_CRON   || '*/5 * * * *';
-const PORT      = parseInt(process.env.PORT, 10) || 8080;
+// --- Configuration ---
+const {
+  TELEGRAM_BOT_TOKEN: BOT_TOKEN,
+  TELEGRAM_CHANNEL_ID: CHAT_ID,
+  HEATMAP_PERIOD: PERIOD = '24h',
+  SCRAPE_CRON: CRON_EXPR = '*/5 * * * *',
+  PORT = 8080,
+  DEBUG_MODE = 'false'
+} = process.env;
 
-// --- Basic Validation ---
+// Simple logger that only prints when DEBUG_MODE is true
+const log = (message) => {
+  if (DEBUG_MODE === 'true') console.log(`[DEBUG] ${message}`);
+};
+
+// --- Validation ---
 if (!BOT_TOKEN || !CHAT_ID) {
-  console.error('❌ Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID environment variables.');
+  console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID.');
   process.exit(1);
 }
 
-// --- Initialize Bot and Web Server ---
+// --- Initialization ---
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 const app = express();
 
-// Health check endpoint for Koyeb
-app.get('/health', (_req, res) => {
-  res.status(200).send('OK');
-});
-
-app.listen(PORT, () => {
-  console.log(`Health check server listening on http://0.0.0.0:${PORT}`);
-});
+app.get('/health', (_req, res) => res.status(200).send('OK'));
+app.listen(PORT, () => console.log(`Health check on http://0.0.0.0:${PORT}/health`));
 
 /**
- * Captures the Coinglass liquidation heatmap using a system-installed Chromium.
- * @returns {Promise<string|null>} The file path to the saved screenshot, or null on failure.
+ * Captures and sends the heatmap, with robust error handling.
  */
-async function captureHeatmap() {
-  console.log(`[${new Date().toLocaleString()}] Starting capture for period: ${PERIOD}`);
+async function captureAndSendHeatmap() {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] Task start for period=${PERIOD}`);
   let browser = null;
+  let page = null;
+  let screenshotPath;
+  let debugPath;
   try {
-    // This is the critical part: we launch puppeteer-core and explicitly
-    // tell it where to find the Chromium browser we installed in the Dockerfile.
     browser = await puppeteer.launch({
       executablePath: '/usr/bin/chromium',
       args: [
-        '--headless=new',                 // Use the modern headless mode
-        '--no-sandbox',                   // Required for running in a container
-        '--disable-dev-shm-usage',        // Avoids memory issues in Docker
-        '--window-size=1920,1080',        // Set a good resolution for the screenshot
+        '--headless',                   // legacy headless for stability
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--window-size=1920,1080',
       ],
+      timeout: 90000,
     });
+    log('Browser launched.');
 
-    const page = await browser.newPage();
-    // Set a high device scale factor for a crisp, high-DPI screenshot
-    await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 2 });
-    
+    page = await browser.newPage();
+    try {
+      await page.setViewport({ width: 1920, height: 1080 });
+      log('Viewport set.');
+    } catch (vpErr) {
+      console.error('Viewport setting failed, continuing without:', vpErr);
+    }
+
     const url = `https://www.coinglass.com/pro/futures/LiquidationHeatMap?period=${PERIOD}`;
-    console.log(`Navigating to ${url}`);
-    
-    // Navigate and wait for the network to be mostly idle
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-    
-    // Wait for the canvas element to appear on the page
-    await page.waitForSelector('canvas', { timeout: 15000 });
-    console.log('Canvas element found.');
+    log(`Navigating to ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+    log('Page loaded.');
 
-    const canvas = await page.$('canvas');
-    // Save the screenshot to a temporary file
-    const filename = `/tmp/heatmap_${Date.now()}.png`;
-    await canvas.screenshot({ path: filename });
-    console.log(`Screenshot saved to ${filename}`);
-    return filename;
+    const canvasSelector = 'canvas[data-zr-dom-id^="zr_"]';
+    await page.waitForSelector(canvasSelector, { timeout: 30000 });
+    log('Canvas selector found.');
+    const canvas = await page.$(canvasSelector);
+    if (!canvas) throw new Error('Canvas not found');
+
+    screenshotPath = `/tmp/heatmap_${Date.now()}.png`;
+    await canvas.screenshot({ path: screenshotPath });
+    console.log(`Saved heatmap to ${screenshotPath}`);
+
+    // Send to Telegram
+    const caption = `📊 Coinglass Heatmap (${PERIOD})\n${new Date().toUTCString()}`;
+    await bot.sendPhoto(CHAT_ID, screenshotPath, { caption });
+    console.log('Heatmap sent.');
 
   } catch (err) {
-    console.error('Capture failed:', err);
-    return null;
-  } finally {
-    if (browser) {
-      await browser.close();
-      console.log('Browser closed.');
+    console.error('Task error:', err);
+    const errorMsg = `❌ Heatmap Capture Failed\n*Time:* ${new Date().toUTCString()}\n*Error:* ${err.message}`;
+    await bot.sendMessage(CHAT_ID, errorMsg, { parse_mode: 'Markdown' }).catch(console.error);
+    if (page) {
+      try {
+        debugPath = `/tmp/debug_${Date.now()}.png`;
+        await page.screenshot({ path: debugPath, fullPage: true });
+        console.log(`Debug screenshot at ${debugPath}`);
+        await bot.sendPhoto(CHAT_ID, debugPath, { caption: '🛠 Debug Screenshot' });
+      } catch (dbgErr) {
+        console.error('Debug screenshot failed:', dbgErr);
+      }
     }
+  } finally {
+    if (browser) await browser.close();
+    [screenshotPath, debugPath].forEach(p => p && fs.existsSync(p) && fs.unlinkSync(p));
+    log('Cleanup done.');
   }
 }
 
-/**
- * Sends the captured heatmap screenshot to the Telegram channel.
- */
-async function sendHeatmap() {
-  const file = await captureHeatmap();
-  const now  = new Date().toLocaleString("en-US", { timeZone: "UTC" });
-  
-  if (!file) {
-    const errorMessage = `❌ **Heatmap Capture Failed**\n_Time: ${now} UTC_`;
-    await bot.sendMessage(CHAT_ID, errorMessage, { parse_mode: 'Markdown' }).catch(console.error);
-    return;
-  }
-  
-  const caption = `📊 **Coinglass Heatmap (${PERIOD})**\n_${now} UTC_`;
-  
-  await bot.sendPhoto(CHAT_ID, file, { caption, parse_mode: 'Markdown' }).catch(console.error);
-  console.log('Photo sent to Telegram.');
-  
-  // Clean up the temporary file
-  fs.unlinkSync(file);
-}
-
-// --- Start the Application ---
-console.log('Bot started. Performing initial run...');
-sendHeatmap();
-
-// Schedule the recurring job
-cron.schedule(CRON_EXPR, () => {
-  console.log(`[${new Date().toLocaleString()}] Cron job triggered.`);
-  sendHeatmap();
-}, {
-  timezone: "Etc/UTC" // Explicitly set timezone for consistency
-});
-
-console.log(`Scheduled to run with cron expression: "${CRON_EXPR}"`);
+// Initial invocation
+captureAndSendHeatmap();
+// Scheduled
+cron.schedule(CRON_EXPR, captureAndSendHeatmap, { timezone: 'Etc/UTC' });
+console.log(`Scheduled with cron: ${CRON_EXPR}`);
