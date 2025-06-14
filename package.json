@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "chrome-aws-lambda": "10.1.0",
     "puppeteer-core": "19.11.1",
     "node-cron": "3.0.0",
     "node-telegram-bot-api": "0.61.0",
